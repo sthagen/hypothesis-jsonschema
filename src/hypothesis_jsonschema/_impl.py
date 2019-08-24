@@ -6,7 +6,7 @@ import math
 import operator
 import re
 from functools import partial
-from typing import Any, Callable, Dict, List, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Set, Union
 
 import hypothesis.internal.conjecture.utils as cu
 import hypothesis.provisional as prov
@@ -58,12 +58,22 @@ SCHEMA_OBJECT_KEYS = ("properties", "patternProperties", "dependencies")
 
 class UnresolvableReference(InvalidArgument):
     """Raised when a reference is not resolvable."""
+
     __module__ = "hypothesis_jsonschema"
 
     @classmethod
     def from_(cls, schema: Schema) -> "UnresolvableReference":
         assert isinstance(schema, dict)
         return cls(f"Could not resolve $ref {schema['$ref']!r} in schema {schema!r}")
+
+
+class LocalResolver(jsonschema.RefResolver):
+    """Resolver that does not make network calls."""
+
+    def resolve_remote(self, uri: str) -> None:
+        raise UnresolvableReference(
+            f"Cannot implicitly resolve remote references at test time ({uri})"
+        )
 
 
 def encode_canonical_json(value: JSONType) -> str:
@@ -102,6 +112,65 @@ def upper_bound_instances(schema: Schema) -> float:
     # TODO: could handle lots more cases here...
     # Converting known cases to enums would also be a good approach.
     return math.inf
+
+
+def iter_subschemas(schema: Schema) -> Iterable[Schema]:
+    """Yield all (sub) schemas in this schema, recursively."""
+    if schema is True:
+        schema = {}
+    elif schema is False:
+        schema = {"not": {}}
+
+    for key in SCHEMA_KEYS:
+        if isinstance(schema.get(key), list):
+            for s in schema[key]:  # type: ignore
+                yield from iter_subschemas(s)  # type: ignore
+        if isinstance(schema.get(key), dict):
+            yield from iter_subschemas(schema[key])  # type: ignore
+    for key in SCHEMA_OBJECT_KEYS:
+        if key in schema:
+            for s in schema[key].values():  # type: ignore
+                if isinstance(s, dict):
+                    yield from iter_subschemas(s)
+    yield schema
+
+
+def replace(schema: Schema, refs: Dict[str, Schema] = None) -> Schema:
+    schema = canonicalish(schema)
+    if refs is None:
+        resolve_fragment = LocalResolver.from_schema(schema).resolve_fragment
+        refs = {}
+        for s in iter_subschemas(schema):
+            if "$ref" in s and s["$ref"].startswith("#/"):  # type: ignore
+                r = s["$ref"]
+                assert isinstance(r, str)
+                refs[r] = resolve_fragment(
+                    schema, s["$ref"].lstrip("#")  # type: ignore
+                )
+        # Resolve nested references until we reach a fixpoint
+        last = ""
+        while last != encode_canonical_json(refs):
+            last = encode_canonical_json(refs)
+            refs = {k: replace(v, [r for r in refs if r != k]) for k, v in refs.items()}
+
+    for key in SCHEMA_KEYS:
+        if isinstance(schema.get(key), list):
+            schema[key] = [replace(v, refs) for v in schema[key]]  # type: ignore
+        if isinstance(schema.get(key), dict):
+            schema[key] = replace(schema[key], refs)  # type: ignore
+    for key in SCHEMA_OBJECT_KEYS:
+        if key in schema:
+            schema[key] = {
+                k: replace(v, refs) if isinstance(v, dict) else v
+                for k, v in schema[key].items()  # type: ignore
+            }
+
+    if schema.get("$ref", "#") != "#":
+        ref = refs[schema.pop("$ref")]  # type: ignore
+        m = merged([schema, ref])
+        assert m is not None
+        schema = m
+    return schema
 
 
 def canonicalish(schema: JSONType) -> Dict:
@@ -416,6 +485,7 @@ def from_schema(schema: dict) -> st.SearchStrategy[JSONType]:
     Schema reuse with "definitions" and "$ref" is not yet supported, but
     everything else in drafts 04, 05, and 07 is fully tested and working.
     """
+    schema = replace(schema)
     schema = canonicalish(schema)
     # Boolean objects are special schemata; False rejects all and True accepts all.
     if schema == FALSEY:
