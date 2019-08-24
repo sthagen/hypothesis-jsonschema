@@ -56,6 +56,16 @@ SCHEMA_KEYS = tuple(
 SCHEMA_OBJECT_KEYS = ("properties", "patternProperties", "dependencies")
 
 
+class UnresolvableReference(InvalidArgument):
+    """Raised when a reference is not resolvable."""
+    __module__ = "hypothesis_jsonschema"
+
+    @classmethod
+    def from_(cls, schema: Schema) -> "UnresolvableReference":
+        assert isinstance(schema, dict)
+        return cls(f"Could not resolve $ref {schema['$ref']!r} in schema {schema!r}")
+
+
 def encode_canonical_json(value: JSONType) -> str:
     """Canonical form serialiser, for uniqueness testing."""
     return json.dumps(value, sort_keys=True)
@@ -415,6 +425,12 @@ def from_schema(schema: dict) -> st.SearchStrategy[JSONType]:
     # Only check if declared, lest we error on inner non-latest-draft schemata.
     if "$schema" in schema:
         jsonschema.validators.validator_for(schema).check_schema(schema)
+
+    # TODO: we fail on references, but will add some logic to resolve local
+    # non-recursive refs to `canonicalish` soon(ish), and some fancy use
+    # of `st.deferred` to resolve recursive schemas a little later :D
+    if "$ref" in schema:
+        raise UnresolvableReference.from_(schema)
 
     # Now we handle as many validation keywords as we can...
     # Applying subschemata with boolean logic

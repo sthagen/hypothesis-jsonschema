@@ -18,6 +18,7 @@ from hypothesis_jsonschema import from_schema
 from hypothesis_jsonschema._impl import (
     FALSEY,
     JSON_STRATEGY,
+    UnresolvableReference,
     canonicalish,
     encode_canonical_json,
     gen_array,
@@ -283,6 +284,22 @@ FLAKY_SCHEMAS = {
     # Just not handling this one correctly yet
     "draft4/additionalProperties should not look in applicators",
     "draft7/additionalProperties should not look in applicators",
+    # Incredibly slow - more than four minutes for just this schema!
+    "Ansible task files",
+    # Incorrect meta-schema specified in $schema
+    "A JSON schema for CRYENGINE projects (.cryproj files)",
+    "Static Analysis Results Format (SARIF), Version 2.1.0-rtm.2",
+    "Static Analysis Results Format (SARIF) External Property File Format, Version 2.1.0-rtm.2",
+    "Static Analysis Results Format (SARIF) External Property File Format, Version 2.1.0-rtm.3",
+    "Static Analysis Results Format (SARIF) External Property File Format, Version 2.1.0-rtm.4",
+    # Unable to satisfy assumptions - TODO: retry after local resolution logic implemented
+    "GeoJSON format for representing geographic data.",
+    "Drone CI configuration file",
+    "PHP Composer configuration file",
+    "snapcraft project  (https://snapcraft.io)",
+    "JSON schema .NET template files",
+    # UnresolvableReference: Could not resolve $ref 'http://json-schema.org/draft-07/schema#'
+    # TODO: maintain mapping of known URLs for draftX schemas ??
 }
 
 with open("corpus-schemastore-catalog.json") as f:
@@ -295,12 +312,6 @@ with open("corpus-reported.json") as f:
     suite.update(reported)
 
 
-def _has_refs(s):
-    if isinstance(s, dict):
-        return "$ref" in s or any(_has_refs(v) for v in s.values())
-    return isinstance(s, list) and any(_has_refs(v) for v in s)
-
-
 def to_name_params(corpus):
     for n in sorted(corpus):
         if n.endswith("/oneOf complex types"):
@@ -309,7 +320,7 @@ def to_name_params(corpus):
             # TODO: see if we can auto-detect this, fix it, and emit a warning.
             assert "type" not in corpus[n]
             corpus[n]["type"] = "object"
-        if n in FLAKY_SCHEMAS or _has_refs(corpus[n]):
+        if n in FLAKY_SCHEMAS:
             yield pytest.param(n, marks=pytest.mark.skip)
         else:
             yield n
@@ -320,7 +331,10 @@ def to_name_params(corpus):
 @given(data=st.data())
 def test_can_generate_for_real_large_schema(data, name):
     note(name)
-    value = data.draw(from_schema(catalog[name]))
+    try:
+        value = data.draw(from_schema(catalog[name]))
+    except UnresolvableReference as e:
+        pytest.skip(str(e))
     jsonschema.validate(value, catalog[name])
 
 
@@ -329,7 +343,10 @@ def test_can_generate_for_real_large_schema(data, name):
 @given(data=st.data())
 def test_can_generate_for_test_suite_schema(data, name):
     note(suite[name])
-    value = data.draw(from_schema(suite[name]))
+    try:
+        value = data.draw(from_schema(suite[name]))
+    except UnresolvableReference as e:
+        pytest.skip(str(e))
     try:
         jsonschema.validate(value, suite[name])
     except jsonschema.exceptions.SchemaError:
@@ -338,9 +355,8 @@ def test_can_generate_for_test_suite_schema(data, name):
 
 @pytest.mark.parametrize("name", to_name_params(invalid_suite))
 def test_cannot_generate_for_empty_test_suite_schema(name):
-    strat = from_schema(invalid_suite[name])
     with pytest.raises(Exception):
-        strat.example()
+        from_schema(invalid_suite[name]).example()
 
 
 # This schema has overlapping patternProperties - this is OK, so long as they're
