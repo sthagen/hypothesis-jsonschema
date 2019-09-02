@@ -136,22 +136,36 @@ def iter_subschemas(schema: Schema) -> Iterable[Schema]:
 
 
 def replace(schema: Schema, refs: Dict[str, Schema] = None) -> Schema:
-    schema = canonicalish(schema)
+    if isinstance(schema, bool):
+        return canonicalish(schema)
+
     if refs is None:
         resolve_fragment = LocalResolver.from_schema(schema).resolve_fragment
-        refs = {}
-        for s in iter_subschemas(schema):
+        refs = {"#": schema}
+        queue = list(iter_subschemas(schema))
+        for s in queue:
             if "$ref" in s and s["$ref"].startswith("#/"):  # type: ignore
                 r = s["$ref"]
                 assert isinstance(r, str)
+                if r in refs:
+                    continue
                 refs[r] = resolve_fragment(
                     schema, s["$ref"].lstrip("#")  # type: ignore
                 )
-        # Resolve nested references until we reach a fixpoint
-        last = ""
-        while last != encode_canonical_json(refs):
-            last = encode_canonical_json(refs)
-            refs = {k: replace(v, [r for r in refs if r != k]) for k, v in refs.items()}
+                # Capture references that may only be referred to indirectly
+                for s in iter_subschemas(refs[r]):
+                    if s.get("$ref", "#") not in refs and s["$ref"].startswith("#/"):
+                        queue.append(s)
+        # For each reference, try to replace its inner references with subschemas that
+        # do not contain any references, and repeat until we reach a fixpoint.
+        simple: Any = True
+        while simple:
+            simple = {
+                k: v
+                for k, v in refs.items()
+                if not any("$ref" in s for s in iter_subschemas(v))
+            }
+            refs = {k: replace(v, simple) for k, v in refs.items() if k not in simple}
 
     for key in SCHEMA_KEYS:
         if isinstance(schema.get(key), list):
@@ -165,7 +179,7 @@ def replace(schema: Schema, refs: Dict[str, Schema] = None) -> Schema:
                 for k, v in schema[key].items()  # type: ignore
             }
 
-    if schema.get("$ref", "#") != "#":
+    if schema.get("$ref", "#") != "#" and schema["$ref"] in refs:
         ref = refs[schema.pop("$ref")]  # type: ignore
         m = merged([schema, ref])
         assert m is not None
