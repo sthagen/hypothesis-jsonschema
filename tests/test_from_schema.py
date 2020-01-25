@@ -9,10 +9,9 @@ import pytest
 import strict_rfc3339
 from hypothesis import HealthCheck, assume, given, note, reject, settings
 from hypothesis.errors import InvalidArgument
-from hypothesis.internal.reflection import proxies
 
 from gen_schemas import schema_strategy_params
-from hypothesis_jsonschema._canonicalise import canonicalish
+from hypothesis_jsonschema._canonicalise import canonicalish, resolve_all_refs
 from hypothesis_jsonschema._from_schema import from_schema, rfc3339
 
 
@@ -90,25 +89,19 @@ def to_name_params(corpus):
         if n in FLAKY_SCHEMAS:
             yield pytest.param(n, marks=pytest.mark.skip)
         else:
-            yield n
-
-
-def ref_fail_to_xfail(f):
-    @proxies(f)
-    def inner(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except jsonschema.exceptions.RefResolutionError:
-            pytest.skip("Could not resolve a reference")
-
-    return inner
+            try:
+                if not isinstance(corpus[n], bool):
+                    resolve_all_refs(corpus[n])
+            except (RecursionError, jsonschema.exceptions.RefResolutionError):
+                yield pytest.param(n, marks=pytest.mark.xfail(strict=False))
+            else:
+                yield n
 
 
 @pytest.mark.skip
 @pytest.mark.parametrize("name", to_name_params(catalog))
 @settings(deadline=None, max_examples=5, suppress_health_check=HealthCheck.all())
 @given(data=st.data())
-@ref_fail_to_xfail
 def test_can_generate_for_real_large_schema(data, name):
     note(name)
     value = data.draw(from_schema(catalog[name]))
@@ -132,7 +125,6 @@ def test_can_generate_for_test_suite_schema(data, name):
 
 
 @pytest.mark.parametrize("name", to_name_params(invalid_suite))
-@ref_fail_to_xfail
 def test_cannot_generate_for_empty_test_suite_schema(name):
     strat = from_schema(invalid_suite[name])
     with pytest.raises(Exception):

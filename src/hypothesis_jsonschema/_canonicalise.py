@@ -457,9 +457,7 @@ class LocalResolver(jsonschema.RefResolver):
         )
 
 
-def resolve_all_refs(
-    schema: JSON_STRATEGY, *, resolver: LocalResolver = None,
-) -> Schema:
+def resolve_all_refs(schema: Schema, *, resolver: LocalResolver = None) -> Schema:
     """
     Resolve all references in the given schema.
 
@@ -467,38 +465,45 @@ def resolve_all_refs(
     The latter require special handling to convert to strategies and are much
     less common, so we just ignore them (and error out) for now.
     """
-    if isinstance(schema, bool):
-        return canonicalish(schema)
     if resolver is None:
         resolver = LocalResolver.from_schema(deepcopy(schema))
+    if not isinstance(resolver, jsonschema.RefResolver):
+        raise InvalidArgument(
+            f"resolver={resolver} (type {type(resolver).__name__}) is not a RefResolver"
+        )
 
-    def res_one(s: JSONType) -> JSONType:
-        assert isinstance(s, (bool, dict))
-        if isinstance(s, bool) or "$ref" not in s:
+    def res_one(s: Schema) -> Schema:
+        if "$ref" not in s:
             return s
-        assert isinstance(resolver, LocalResolver)
-        with resolver.resolving(s.pop("$ref")) as got:
-            m = merged([got, s])
+        assert isinstance(resolver, jsonschema.RefResolver)
+        ref = s.pop("$ref")
+        with resolver.resolving(ref) as got:
+            m = merged([s, got])
             if m is None:
-                raise InvalidArgument("Un-mergable base schema for ref")
+                raise jsonschema.exceptions.RefResolutionError(
+                    f"$ref:{ref!r} had incompatible base schema {s!r}"
+                )
             return resolve_all_refs(m, resolver=resolver)
 
     if "$ref" in schema:
         schema = res_one(schema)
     for key in SCHEMA_KEYS:
-        if isinstance(schema.get(key), list):
-            for i, v in enumerate(schema[key]):
-                schema[key][i] = res_one(v)
-        elif isinstance(schema.get(key), (bool, dict)):
-            schema[key] = res_one(schema[key])
+        val = schema.get(key, False)
+        if isinstance(val, list):
+            schema[key] = [res_one(v) if isinstance(v, dict) else v for v in val]
+        elif isinstance(val, dict):
+            schema[key] = res_one(val)
         else:
-            assert key not in schema
+            assert isinstance(val, bool)
     for key in SCHEMA_OBJECT_KEYS:
         if key in schema:
-            schema[key] = {
-                k: v if isinstance(v, list) else res_one(v)
-                for k, v in schema[key].items()
-            }
+            s = schema[key]
+            if isinstance(s, dict):
+                schema[key] = {
+                    k: res_one(v) if isinstance(v, dict) else v for k, v in s.items()
+                }
+            else:
+                assert isinstance(s, bool), s
     assert isinstance(schema, dict)
     return schema
 

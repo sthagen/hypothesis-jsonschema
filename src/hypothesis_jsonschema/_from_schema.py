@@ -83,7 +83,7 @@ def from_schema(schema: Union[bool, Schema]) -> st.SearchStrategy[JSONType]:
         schema = resolve_all_refs(schema)
     except RecursionError:
         raise jsonschema.exceptions.RefResolutionError(
-            "hypothesis-jsonschema does not yet support recursive references."
+            f"Could not resolve recursive references in schema={schema!r}"
         ) from None
 
     # Now we handle as many validation keywords as we can...
