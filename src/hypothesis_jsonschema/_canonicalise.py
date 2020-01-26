@@ -476,15 +476,16 @@ def resolve_all_refs(schema: Schema, *, resolver: LocalResolver = None) -> Schem
         if "$ref" not in s:
             return s
         assert isinstance(resolver, jsonschema.RefResolver)
+        s = dict(s)
         ref = s.pop("$ref")
         with resolver.resolving(ref) as got:
             if s == {}:
-                return resolve_all_refs(dict(got), resolver=resolver)
+                return resolve_all_refs(got, resolver=resolver)
             m = merged([s, got])
             if m is None:
                 msg = f"$ref:{ref!r} had incompatible base schema {s!r}"
                 raise jsonschema.exceptions.RefResolutionError(msg)
-            return resolve_all_refs(dict(m), resolver=resolver)
+            return resolve_all_refs(m, resolver=resolver)
 
     if "$ref" in schema:
         schema = res_one(schema)
