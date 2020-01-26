@@ -497,15 +497,13 @@ def resolve_all_refs(schema: Schema, *, resolver: LocalResolver = None) -> Schem
             schema[key] = res_one(val)
         else:
             assert isinstance(val, bool)
-    for key in SCHEMA_OBJECT_KEYS:
+    for key in SCHEMA_OBJECT_KEYS:  # values are keys-to-schema-dicts, not schemas
         if key in schema:
             s = schema[key]
-            if isinstance(s, dict):
-                schema[key] = {
-                    k: res_one(v) if isinstance(v, dict) else v for k, v in s.items()
-                }
-            else:
-                assert isinstance(s, bool), s
+            assert isinstance(s, dict)
+            schema[key] = {
+                k: res_one(v) if isinstance(v, dict) else v for k, v in s.items()
+            }
     assert isinstance(schema, dict)
     return schema
 

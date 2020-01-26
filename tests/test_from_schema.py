@@ -62,6 +62,8 @@ FLAKY_SCHEMAS = {
     # Something weird about a null that should be a string??  TODO: debug that.
     "Datalogic Scan2Deploy Android file",
     "Datalogic Scan2Deploy CE file",
+    # Schema requires draft 03, which hypothesis-jsonschema doesn't support
+    "A JSON Schema for ninjs by the IPTC. News and publishing information. See https://iptc.org/standards/ninjs/-1.0",
     # Just not handling this one correctly yet
     "draft4/additionalProperties should not look in applicators",
     "draft7/additionalProperties should not look in applicators",
@@ -69,6 +71,12 @@ FLAKY_SCHEMAS = {
     "draft7/ECMA 262 regex escapes control codes with \\c and upper letter",
     # Reference-related
     "draft4/remote ref, containing refs itself",
+    # Occasionally really slow
+    "snapcraft project  (https://snapcraft.io)",
+    "batect configuration file",
+    # Sometimes unsatisfiable.  TODO: improve canonicalisation to remove filters
+    "Drone CI configuration file",
+    "PHP Composer configuration file",
 }
 
 with open(Path(__file__).parent / "corpus-schemastore-catalog.json") as f:
@@ -92,6 +100,15 @@ def to_name_params(corpus):
         if n in FLAKY_SCHEMAS or n.startswith("Ansible task files-"):
             yield pytest.param(n, marks=pytest.mark.skip)
         else:
+            if isinstance(corpus[n], dict) and "$schema" in corpus[n]:
+                try:
+                    jsonschema.validators.validator_for(corpus[n]).check_schema(
+                        corpus[n]
+                    )
+                except Exception:
+                    # The metaschema specified by $schema was not found.
+                    yield pytest.param(n, marks=pytest.mark.skip)
+                    continue
             yield n
 
 
@@ -106,7 +123,6 @@ def xfail_on_reference_resolve_error(f):
     return inner
 
 
-@pytest.mark.skip
 @pytest.mark.parametrize("name", to_name_params(catalog))
 @settings(deadline=None, max_examples=5, suppress_health_check=HealthCheck.all())
 @given(data=st.data())
@@ -196,3 +212,8 @@ def test_numeric_uniqueness(value):
     # but in this case the type of the enum elements matter and we don't want to
     # allow a flexible JSON loader to mess things up.
     jsonschema.validate(value, UNIQUE_NUMERIC_ARRAY_SCHEMA)
+
+
+def test_draft03_not_supported():
+    with pytest.raises(InvalidArgument):
+        from_schema({"$schema": "http://json-schema.org/draft-03/schema#"})

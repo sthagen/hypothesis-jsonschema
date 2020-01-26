@@ -13,6 +13,7 @@ import hypothesis.provisional as prov
 import hypothesis.strategies as st
 import jsonschema
 from hypothesis import assume
+from hypothesis.errors import InvalidArgument
 
 from ._canonicalise import (
     FALSEY,
@@ -78,6 +79,8 @@ def from_schema(schema: Union[bool, Schema]) -> st.SearchStrategy[JSONType]:
     # Only check if declared, lest we error on inner non-latest-draft schemata.
     if "$schema" in schema:
         jsonschema.validators.validator_for(schema).check_schema(schema)
+        if schema["$schema"] == "http://json-schema.org/draft-03/schema#":
+            raise InvalidArgument("Draft-03 schemas are not supported")
 
     try:
         schema = resolve_all_refs(schema)
@@ -90,6 +93,7 @@ def from_schema(schema: Union[bool, Schema]) -> st.SearchStrategy[JSONType]:
     # Applying subschemata with boolean logic
     if "not" in schema:
         not_ = schema.pop("not")
+        assert isinstance(not_, dict)
         return from_schema(schema).filter(lambda v: not is_valid(v, not_))
     if "anyOf" in schema:
         tmp = schema.copy()
