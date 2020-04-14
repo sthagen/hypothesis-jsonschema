@@ -146,9 +146,22 @@ def from_schema(schema: Union[bool, Schema]) -> st.SearchStrategy[JSONType]:
     return st.one_of([map_[t](schema) for t in get_type(schema)])
 
 
+def _as_float_if_eq(i: int) -> float:
+    """Convert `i` to a float, or leave as int on loss of precision."""
+    # This is useful because {"type": "integer"} allows values of
+    # Python type float so long as they represent a whole number.
+    try:
+        f = float(i)
+    except OverflowError:
+        return i
+    else:
+        if i == f:
+            return f
+        return i
+
+
 def integer_schema(schema: dict) -> st.SearchStrategy[float]:
     """Handle integer schemata."""
-    # TODO: possibly generate value as a float if float(x) == x
     min_value, max_value = get_integer_bounds(schema)
 
     if "multipleOf" in schema:
@@ -160,9 +173,11 @@ def integer_schema(schema: dict) -> st.SearchStrategy[float]:
             max_value = math.floor(Fraction(max_value) / Fraction(multiple_of))
         strat = st.integers(min_value, max_value).map(lambda x: x * multiple_of)
         # check for and filter out float bounds, inexact multiplication, etc.
-        return strat.filter(partial(is_valid, schema=schema))
+        strat = strat.filter(partial(is_valid, schema=schema))
+    else:
+        strat = st.integers(min_value, max_value)
 
-    return st.integers(min_value, max_value)
+    return strat | strat.map(_as_float_if_eq)
 
 
 def number_schema(schema: dict) -> st.SearchStrategy[float]:

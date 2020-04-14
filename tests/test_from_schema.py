@@ -235,3 +235,8 @@ def test_numeric_uniqueness(value):
 def test_draft03_not_supported():
     with pytest.raises(InvalidArgument):
         from_schema({"$schema": "http://json-schema.org/draft-03/schema#"})
+
+
+@given(from_schema({"type": "integer"}).filter(lambda i: isinstance(i, float)))
+def test_integer_schema_can_generate_float_values(val):
+    assert val == int(val)
