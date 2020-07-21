@@ -1,5 +1,24 @@
 # Changelog
 
+#### 0.17.3 - 2020-07-17
+- improved handling of overlapping `items` keywords (#58)
+
+#### 0.17.2 - 2020-07-16
+- improved handling of overlapping `dependencies` keywords (#57)
+
+#### 0.17.1 - 2020-07-16
+- fixed an internal bug where results incorrectly depended on iteration order (#59)
+
+#### 0.17.0 - 2020-07-16
+- Adds a `custom_formats` keyword argument to `from_schema()`, so that you can
+  specify a strategy to generate strings for custom formats like credit card numbers.
+  Thanks to Dmitry Dygalo, whose [sponsorship](https://github.com/sponsors/Zac-HD)
+  motivated me to add the feature!
+
+#### 0.16.2 - 2020-07-12
+- Substantial performance gains for some schemas, via improved handling of the
+  `contains`, `not`, `anyOf`, and `if/then/else` keywords
+
 #### 0.16.1 - 2020-06-15
 - Performance improvement for `object` schemas with `additionalProperties: false` (issue #55)
 

@@ -13,6 +13,7 @@ most things by construction instead of by filtering.  That's the difference
 between "I'd like it to be faster" and "doesn't finish at all".
 """
 
+import itertools
 import json
 import math
 import re
@@ -279,6 +280,18 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
         elif len(enum_) == 1:
             return {"const": enum_[0]}
         return {"enum": enum_}
+    # if/then/else schemas are ignored unless if and another are present
+    if_ = schema.pop("if", None)
+    then = schema.pop("then", schema)
+    else_ = schema.pop("else", schema)
+    if if_ is not None and (then is not schema or else_ is not schema):
+        schema = {
+            "anyOf": [
+                {"allOf": [if_, then, schema]},
+                {"allOf": [{"not": if_}, else_, schema]},
+            ]
+        }
+    assert isinstance(schema, dict)
     # Recurse into the value of each keyword with a schema (or list of them) as a value
     for key in SCHEMA_KEYS:
         if isinstance(schema.get(key), list):
@@ -286,7 +299,7 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
         elif isinstance(schema.get(key), (bool, dict)):
             schema[key] = canonicalish(schema[key])
         else:
-            assert key not in schema
+            assert key not in schema, (key, schema[key])
     for key in SCHEMA_OBJECT_KEYS:
         if key in schema:
             schema[key] = {
@@ -347,8 +360,14 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
         if schema["contains"] == TRUTHY:
             schema.pop("contains")
             schema["minItems"] = max(schema.get("minItems", 1), 1)
-    # TODO: upper_bound_instances on the items, and use that to set maxItems
-    # constraint for unique arrays.  Not worth handling list-items though...
+    if (
+        "array" in type_
+        and "uniqueItems" in schema
+        and isinstance(schema.get("items", []), dict)
+    ):
+        item_count = upper_bound_instances(schema["items"])
+        if math.isfinite(item_count):
+            schema["maxItems"] = min(item_count, schema.get("maxItems", math.inf))
     if "array" in type_ and schema.get("minItems", 0) > schema.get(
         "maxItems", math.inf
     ):
@@ -404,9 +423,25 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
         "maxProperties", math.inf
     ):
         type_.remove("object")
-    # Remove no-op requires
-    if "required" in schema and not schema["required"]:
-        schema.pop("required")
+    # Discard dependencies values that don't restrict anything
+    for k, v in schema.get("dependencies", {}).copy().items():
+        if v == [] or v == TRUTHY:
+            schema["dependencies"].pop(k)
+    # Remove no-op keywords
+    for kw, identity in {
+        "minItems": 0,
+        "items": {},
+        "additionalItems": {},
+        "dependencies": {},
+        "minProperties": 0,
+        "properties": {},
+        "propertyNames": {},
+        "patternProperties": {},
+        "additionalProperties": {},
+        "required": [],
+    }.items():
+        if kw in schema and schema[kw] == identity:
+            schema.pop(kw)
     # Canonicalise "required" schemas to remove redundancy
     if "object" in type_ and "required" in schema:
         assert isinstance(schema["required"], list)
@@ -415,16 +450,20 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
             # When the presence of a required property requires other properties via
             # dependencies, those properties can be moved to the base required keys.
             dep_names = {
-                k: sorted(v)
+                k: sorted(set(v))
                 for k, v in schema["dependencies"].items()
                 if isinstance(v, list)
             }
+            schema["dependencies"].update(dep_names)
             while reqs.intersection(dep_names):
                 for r in reqs.intersection(dep_names):
                     reqs.update(dep_names.pop(r))
-            for k, v in list(schema["dependencies"].items()):
-                if isinstance(v, list) and k not in dep_names:
-                    schema["dependencies"].pop(k)
+                    schema["dependencies"].pop(r)
+                    # TODO: else merge schema-dependencies of required properties
+                    # into the base schema after adding required back in and being
+                    # careful to avoid an infinite loop...
+            if not schema["dependencies"]:
+                schema.pop("dependencies")
         schema["required"] = sorted(reqs)
         max_ = schema.get("maxProperties", float("inf"))
         assert isinstance(max_, (int, float))
@@ -449,26 +488,33 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
     # Canonicalise "not" subschemas
     if "not" in schema:
         not_ = schema.pop("not")
-        if not_ == TRUTHY or not_ == schema:
-            # If everything is rejected, discard all other (irrelevant) keys
-            # TODO: more sensitive detection of cases where the not-clause
-            # excludes everything in the schema.
-            return FALSEY
-        type_keys = {k: set(v.split()) for k, v in TYPE_SPECIFIC_KEYS}
-        type_constraints = {"type"}
-        for v in type_keys.values():
-            type_constraints |= v
-        if set(not_).issubset(type_constraints):
-            not_["type"] = get_type(not_)
-            for t in set(type_).intersection(not_["type"]):
-                if not type_keys.get(t, set()).intersection(not_):
-                    type_.remove(t)
-                    if t not in ("integer", "number"):
-                        not_["type"].remove(t)
-            not_ = canonicalish(not_)
-        if not_ != FALSEY:
-            # If the "not" key rejects nothing, discard it
-            schema["not"] = not_
+
+        negated = []
+        to_negate = not_["anyOf"] if set(not_) == {"anyOf"} else [not_]
+        for not_ in to_negate:
+            type_keys = {k: set(v.split()) for k, v in TYPE_SPECIFIC_KEYS}
+            type_constraints = {"type"}
+            for v in type_keys.values():
+                type_constraints |= v
+            if set(not_).issubset(type_constraints):
+                not_["type"] = get_type(not_)
+                for t in set(type_).intersection(not_["type"]):
+                    if not type_keys.get(t, set()).intersection(not_):
+                        type_.remove(t)
+                        if t not in ("integer", "number"):
+                            not_["type"].remove(t)
+                not_ = canonicalish(not_)
+
+            m = merged([not_, {**schema, "type": type_}])
+            if m is not None:
+                not_ = m
+            if not_ != FALSEY:
+                negated.append(not_)
+        if len(negated) > 1:
+            schema["not"] = {"anyOf": negated}
+        elif negated:
+            schema["not"] = negated[0]
+
     assert isinstance(type_, list), type_
     if not type_:
         assert type_ == []
@@ -490,8 +536,19 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
     if TRUTHY in schema.get("anyOf", ()):
         schema.pop("anyOf", None)
     if "anyOf" in schema:
-        schema["anyOf"] = sorted(schema["anyOf"], key=encode_canonical_json)
-        schema["anyOf"] = [s for s in schema["anyOf"] if s != FALSEY]
+        i = 0
+        while i < len(schema["anyOf"]):
+            s = schema["anyOf"][i]
+            if set(s) == {"anyOf"}:
+                schema["anyOf"][i : i + 1] = s["anyOf"]
+                continue
+            i += 1
+        schema["anyOf"] = [
+            json.loads(s)
+            for s in sorted(
+                {encode_canonical_json(a) for a in schema["anyOf"] if a != FALSEY}
+            )
+        ]
         if not schema["anyOf"]:
             return FALSEY
         if len(schema) == len(schema["anyOf"]) == 1:
@@ -528,12 +585,6 @@ def canonicalish(schema: JSONType) -> Dict[str, Any]:
         if (not one_of) or one_of.count(TRUTHY) > 1:
             return FALSEY
         schema["oneOf"] = one_of
-    # if/then/else schemas are ignored unless if and another are present
-    if "if" not in schema:
-        schema.pop("then", None)
-        schema.pop("else", None)
-    if "then" not in schema and "else" not in schema:
-        schema.pop("if", None)
     if schema.get("uniqueItems") is False:
         del schema["uniqueItems"]
     return schema
@@ -562,6 +613,7 @@ def resolve_all_refs(
     """
     if isinstance(schema, bool):
         return canonicalish(schema)
+    assert isinstance(schema, dict), schema
     if resolver is None:
         resolver = LocalResolver.from_schema(deepcopy(schema))
     if not isinstance(resolver, jsonschema.RefResolver):
@@ -643,8 +695,11 @@ def merged(schemas: List[Any]) -> Optional[Schema]:
 
         if "type" in out and "type" in s:
             tt = s.pop("type")
+            ot = get_type(out)
+            if "number" in ot:
+                ot.append("integer")
             out["type"] = [
-                t for t in get_type(out) if t in tt or t == "integer" and "number" in tt
+                t for t in ot if t in tt or t == "integer" and "number" in tt
             ]
             out_type = get_type(out)
             if not out_type:
@@ -740,12 +795,79 @@ def merged(schemas: List[Any]) -> Optional[Schema]:
                     out["multipleOf"] = max(x, y)
                 else:
                     return None
-        # TODO: merge `contains` schemas when one is a subset of the other
-        # TODO: merge `items` schemas or lists-of-schemas
-        # TODO: merge `not` schemas as {not: anyOf: [not1, not2]}
-        # TODO: merge if/then/else schemas to the chained form
-        #       or maybe canonicalise them to an anyOf instead?
-        # TODO: merge dependencies
+        if "contains" in out and "contains" in s and out["contains"] != s["contains"]:
+            # If one `contains` schema is a subset of the other, we can discard it.
+            m = merged([out["contains"], s["contains"]])
+            if m == out["contains"] or m == s["contains"]:
+                out["contains"] = m
+                s.pop("contains")
+        if "not" in out and "not" in s and out["not"] != s["not"]:
+            out["not"] = {"anyOf": [out["not"], s.pop("not")]}
+        if (
+            "dependencies" in out
+            and "dependencies" in s
+            and out["dependencies"] != s["dependencies"]
+        ):
+            # Note: draft 2019-09 added separate keywords for name-dependencies
+            # and schema-dependencies, but when we add support for that it will
+            # be by canonicalising to the existing backwards-compatible keyword.
+            #
+            # In each dependencies dict, the keys are property names and the values
+            # are either a list of required names, or a schema that the whole
+            # instance must match.  To merge a list and a schema, convert the
+            # former into a `required` key!
+            odeps = out["dependencies"]
+            for k, v in odeps.copy().items():
+                if k in s["dependencies"]:
+                    sval = s["dependencies"].pop(k)
+                    if isinstance(v, list) and isinstance(sval, list):
+                        odeps[k] = v + sval
+                        continue
+                    if isinstance(v, list):
+                        v = {"required": v}
+                    elif isinstance(sval, list):
+                        sval = {"required": sval}
+                    m = merged([v, sval])
+                    if m is None:
+                        return None
+                    odeps[k] = m
+            odeps.update(s.pop("dependencies"))
+        if "items" in out or "items" in s:
+            oitems = out.pop("items", TRUTHY)
+            sitems = s.pop("items", TRUTHY)
+            if isinstance(oitems, list) and isinstance(sitems, list):
+                out["items"] = []
+                out["additionalItems"] = merged(
+                    [
+                        out.get("additionalItems", TRUTHY),
+                        s.get("additionalItems", TRUTHY),
+                    ]
+                )
+                for a, b in itertools.zip_longest(oitems, sitems):
+                    if a is None:
+                        a = out.get("additionalItems", TRUTHY)
+                    elif b is None:
+                        b = s.get("additionalItems", TRUTHY)
+                    out["items"].append(merged([a, b]))
+            elif isinstance(oitems, list):
+                out["items"] = [merged([x, sitems]) for x in oitems]
+                out["additionalItems"] = merged(
+                    [out.get("additionalItems", TRUTHY), sitems]
+                )
+            elif isinstance(sitems, list):
+                out["items"] = [merged([x, oitems]) for x in sitems]
+                out["additionalItems"] = merged(
+                    [s.get("additionalItems", TRUTHY), oitems]
+                )
+            else:
+                out["items"] = merged([oitems, sitems])
+                if out["items"] is None:
+                    return None
+            if isinstance(out["items"], list) and None in out["items"]:
+                return None
+            if out.get("additionalItems", TRUTHY) is None:
+                return None
+            s.pop("additionalItems", None)
 
         # This loop handles the remaining cases.  Notably, we do not attempt to
         # merge distinct values for:
@@ -754,6 +876,7 @@ def merged(schemas: List[Any]) -> Optional[Schema]:
         # - `$ref`; if not already resolved we can't do that here
         # - `anyOf`; due to product-like explosion in worst case
         # - `oneOf`; which we plan to handle as an anyOf-not composition
+        # - `if`/`then`/`else`; which is removed by canonicalisation
         for k, v in s.items():
             if k not in out:
                 out[k] = v

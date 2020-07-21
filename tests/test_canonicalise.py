@@ -2,13 +2,12 @@
 
 import json
 
-import hypothesis.strategies as st
 import jsonschema
 import pytest
-from hypothesis import HealthCheck, assume, given, note, settings
+from gen_schemas import gen_number, json_schemata, schema_strategy_params
+from hypothesis import HealthCheck, assume, given, note, settings, strategies as st
 from hypothesis.errors import InvalidArgument
 
-from gen_schemas import gen_number, json_schemata, schema_strategy_params
 from hypothesis_jsonschema import from_schema
 from hypothesis_jsonschema._canonicalise import (
     FALSEY,
@@ -52,6 +51,14 @@ def test_canonicalises_to_equivalent_fixpoint(schema_strategy, data):
     instance = data.draw(JSON_STRATEGY | strat, label="instance")
     assert is_valid(instance, schema) == is_valid(instance, cc)
     jsonschema.validators.validator_for(schema).check_schema(schema)
+
+
+def test_dependencies_canonicalises_to_fixpoint():
+    """Check that an object drawn from an arbitrary schema is valid."""
+    cc = canonicalish(
+        {"required": [""], "properties": {"": {}}, "dependencies": {"": [""]}}
+    )
+    assert cc == canonicalish(cc)
 
 
 @pytest.mark.parametrize(
@@ -102,6 +109,8 @@ def test_canonicalises_to_equivalent_fixpoint(schema_strategy, data):
             "multipleOf": 3,
         },
         {"not": {"type": ["integer", "number"]}, "type": "number"},
+        {"not": {"anyOf": [{"type": "integer"}, {"type": "number"}]}, "type": "number"},
+        {"not": {"enum": [1, 2, 3]}, "const": 2},
         {"oneOf": []},
         {"oneOf": [{}, {}]},
         {"oneOf": [True, False, {}]},
@@ -138,6 +147,7 @@ def test_canonicalises_to_empty(schema):
     [
         ({"type": get_type({})}, {}),
         ({"required": []}, {}),
+        ({"type": "integer", "not": {"type": "string"}}, {"type": "integer"}),
         (
             {"type": "array", "items": [True, False, True]},
             {"type": "array", "items": [{}], "maxItems": 1},
@@ -194,6 +204,17 @@ def test_canonicalises_to_empty(schema):
             {"minItems": 1, "type": "array"},
         ),
         ({"anyOf": [{}, {"type": "null"}]}, {}),
+        ({"anyOf": [{"anyOf": [{"anyOf": [{"type": "null"}]}]}]}, {"const": None}),
+        (
+            {
+                "anyOf": [
+                    {"type": "string"},
+                    {"anyOf": [{"type": "number"}, {"type": "array"}]},
+                ]
+            },
+            # TODO: collapse into {"type": ["string", "number", "array"]}
+            {"anyOf": [{"type": "array"}, {"type": "number"}, {"type": "string"}]},
+        ),
         ({"uniqueItems": False}, {}),
         (
             {
@@ -220,6 +241,15 @@ def test_canonicalises_to_empty(schema):
                 "minItems": 1,
                 "items": {"type": "number", "multipleOf": 0.5},
                 "contains": {"type": "number", "multipleOf": 0.75},
+            },
+        ),
+        (
+            {"type": "array", "items": {"const": 1}, "uniqueItems": True},
+            {
+                "type": "array",
+                "items": {"const": 1},
+                "uniqueItems": True,
+                "maxItems": 1,
             },
         ),
     ],
@@ -323,6 +353,73 @@ def test_canonicalises_to_expected(schema, expected):
                 "properties": {"ab": {"const": True}},
             },
         ),
+        (
+            [
+                {"type": "array", "contains": {"type": "integer"}},
+                {"type": "array", "contains": {"type": "number"}},
+            ],
+            {"type": "array", "contains": {"type": "integer"}, "minItems": 1},
+        ),
+        (
+            [{"not": {"enum": [1, 2, 3]}}, {"not": {"enum": ["a", "b", "c"]}}],
+            {"not": {"anyOf": [{"enum": ["a", "b", "c"]}, {"enum": [1, 2, 3]}]}},
+        ),
+        (
+            [{"dependencies": {"a": ["b"]}}, {"dependencies": {"a": ["c"]}}],
+            {"dependencies": {"a": ["b", "c"]}},
+        ),
+        (
+            [{"dependencies": {"a": ["b"]}}, {"dependencies": {"b": ["c"]}}],
+            {"dependencies": {"a": ["b"], "b": ["c"]}},
+        ),
+        (
+            [
+                {"dependencies": {"a": ["b"]}},
+                {"dependencies": {"a": {"properties": {"b": {"type": "string"}}}}},
+            ],
+            {
+                "dependencies": {
+                    "a": {"required": ["b"], "properties": {"b": {"type": "string"}}}
+                },
+            },
+        ),
+        (
+            [
+                {"dependencies": {"a": {"properties": {"b": {"type": "string"}}}}},
+                {"dependencies": {"a": ["b"]}},
+            ],
+            {
+                "dependencies": {
+                    "a": {"required": ["b"], "properties": {"b": {"type": "string"}}}
+                },
+            },
+        ),
+        (
+            [
+                {"dependencies": {"a": {"pattern": "a"}}},
+                {"dependencies": {"a": {"pattern": "b"}}},
+            ],
+            None,
+        ),
+        ([{"items": {"pattern": "a"}}, {"items": {"pattern": "b"}}], None),
+        ([{"items": [{"pattern": "a"}]}, {"items": [{"pattern": "b"}]}], None,),
+        (
+            [
+                {"items": [{}], "additionalItems": {"pattern": "a"}},
+                {"items": [{}], "additionalItems": {"pattern": "b"}},
+            ],
+            None,
+        ),
+        (
+            [
+                {"items": [{}, {"type": "string"}], "additionalItems": False},
+                {"items": [{"type": "string"}]},
+            ],
+            {
+                "items": [{"type": "string"}, {"type": "string"}],
+                "additionalItems": FALSEY,
+            },
+        ),
     ]
     + [
         ([{lo: 0, hi: 9}, {lo: 1, hi: 10}], {lo: 1, hi: 9})
@@ -363,6 +460,7 @@ def test_merge_semantics(data, s1, s2):
     assume(canonicalish(s1) != FALSEY and canonicalish(s2) != FALSEY)
     combined = merged([s1, s2])
     assume(combined is not None)
+    assert combined == merged([s2, s1])  # union is commutative
     assume(combined != FALSEY)
     _merge_semantics_helper(data, s1, s2, combined)
 

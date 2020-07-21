@@ -1,20 +1,29 @@
 """Tests for the hypothesis-jsonschema library."""
 
 import json
+import re
 from pathlib import Path
 
-import hypothesis.strategies as st
 import jsonschema
 import pytest
 import strict_rfc3339
-from hypothesis import HealthCheck, assume, given, note, reject, settings
+from gen_schemas import schema_strategy_params
+from hypothesis import (
+    HealthCheck,
+    assume,
+    given,
+    note,
+    reject,
+    settings,
+    strategies as st,
+)
 from hypothesis.errors import FailedHealthCheck, InvalidArgument
 from hypothesis.internal.reflection import proxies
 
-from gen_schemas import schema_strategy_params
 from hypothesis_jsonschema._canonicalise import (
     HypothesisRefResolutionError,
     canonicalish,
+    resolve_all_refs,
 )
 from hypothesis_jsonschema._from_schema import from_schema, rfc3339
 
@@ -65,10 +74,6 @@ def test_invalid_schemas_raise(schema):
 
 
 INVALID_SCHEMAS = {
-    # Includes a list where it should have a dict
-    "TypeScript Lint configuration file",
-    # This schema is missing the "definitions" key which means they're not resolvable.
-    "Cirrus CI configuration files",
     # Empty list for requires, which is invalid
     "Release Drafter configuration file",
     # Many, many schemas have invalid $schema keys, which emit a warning (-Werror)
@@ -81,6 +86,12 @@ INVALID_SCHEMAS = {
     "Static Analysis Results Format (SARIF) External Property File Format, Version 2.1.0-rtm.5",
     "Static Analysis Results Format (SARIF), Version 2.1.0-rtm.2",
     "Zuul CI configuration file",
+}
+NON_EXISTENT_REF_SCHEMAS = {
+    "Cirrus CI configuration files",
+    "The Bamboo Specs allows you to define Bamboo configuration as code, and have corresponding plans/deployments created or updated automatically in Bamboo",
+    # Special case - reference is valid, but target is list-format `items` rather than a subschema
+    "TypeScript Lint configuration file",
 }
 UNSUPPORTED_SCHEMAS = {
     # Technically valid, but using regex patterns not supported by Python
@@ -128,6 +139,7 @@ SLOW_SCHEMAS = {
     "Ansible task files-2.6",
     "Ansible task files-2.7",
     "Ansible task files-2.9",
+    "JSON Schema for GraphQL Code Generator config file",
     # oneOf on property names means only objects are valid, but it's a very
     # filter-heavy way to express that.  TODO: canonicalise oneOf to anyOf.
     "draft7/oneOf complex types",
@@ -145,7 +157,7 @@ with open(Path(__file__).parent / "corpus-reported.json") as f:
 
 def to_name_params(corpus):
     for n in sorted(corpus):
-        if n in INVALID_SCHEMAS:
+        if n in INVALID_SCHEMAS | NON_EXISTENT_REF_SCHEMAS:
             continue
         if n in UNSUPPORTED_SCHEMAS:
             continue
@@ -157,6 +169,18 @@ def to_name_params(corpus):
             if isinstance(corpus[n], dict) and "$schema" in corpus[n]:
                 jsonschema.validators.validator_for(corpus[n]).check_schema(corpus[n])
             yield n
+
+
+@pytest.mark.parametrize("name", sorted(INVALID_SCHEMAS))
+def test_invalid_schemas_are_invalid(name):
+    with pytest.raises(Exception):
+        jsonschema.validators.validator_for(catalog[name]).check_schema(catalog[name])
+
+
+@pytest.mark.parametrize("name", sorted(NON_EXISTENT_REF_SCHEMAS))
+def test_invalid_ref_schemas_are_invalid(name):
+    with pytest.raises(Exception):
+        resolve_all_refs(catalog[name])
 
 
 RECURSIVE_REFS = {
@@ -204,6 +228,10 @@ RECURSIVE_REFS = {
     "Vega-Lite visualization specification file",
     "Language grammar description files in Textmate and compatible editors",
     "JSON Schema for GraphQL Mesh Config gile-0.0.16",
+    "Azure Pipelines YAML pipelines definition",
+    "Action and rule configuration descriptor for Yippee-Ki-JSON transformations.-1.1.2",
+    "Action and rule configuration descriptor for Yippee-Ki-JSON transformations.-latest",
+    "Schema for Camel K YAML DSL",
 }
 
 
@@ -354,3 +382,46 @@ def test_multiple_contains_behind_allof(value):
     # By placing *multiple* contains elements behind "allOf" we've disabled the
     # mixed-generation logic, and so we can't generate any valid instances at all.
     jsonschema.validate(value, ALLOF_CONTAINS)
+
+
+@jsonschema.FormatChecker.cls_checks("card-test")
+def validate_card_format(string):
+    # For the real thing, you'd want use the Luhn algorithm; this is enough for tests.
+    return bool(re.match(r"^\d{4} \d{4} \d{4} \d{4}$", string))
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"foo": "not a strategy"},
+        {5: st.just("name is not a string")},
+        {"full-date": st.just("2000-01-01")},  # can't override a standard format
+        {"card-test": st.just("not a valid card")},
+    ],
+)
+@given(data=st.data())
+def test_custom_formats_validation(data, kw):
+    s = from_schema({"type": "string", "format": "card-test"}, custom_formats=kw)
+    with pytest.raises(InvalidArgument):
+        data.draw(s)
+
+
+@given(
+    num=from_schema(
+        {"type": "string", "format": "card-test"},
+        custom_formats={"card-test": st.just("4111 1111 1111 1111")},
+    )
+)
+def test_allowed_custom_format(num):
+    assert num == "4111 1111 1111 1111"
+
+
+@given(
+    string=from_schema(
+        {"type": "string", "format": "not registered"},
+        custom_formats={"not registered": st.just("hello world")},
+    )
+)
+def test_allowed_unknown_custom_format(string):
+    assert string == "hello world"
+    assert "not registered" not in jsonschema.FormatChecker().checkers
